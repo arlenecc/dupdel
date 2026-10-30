@@ -35,6 +35,8 @@ public struct DuplicateGroup: Sendable, Identifiable, Equatable {
     public let keeperIndex: Int
     /// 冗余副本数量（缓存，避免 UI 频繁遍历数组）。
     public let redundantCount: Int
+    /// 保留者是否由用户手动指定（而非策略自动选出）。
+    public let isKeeperManual: Bool
 
     public init(hash: String, files: [FileEntry], policy: KeepPolicy = .newest) {
         precondition(!files.isEmpty, "DuplicateGroup 至少需要 1 个文件")
@@ -43,11 +45,36 @@ public struct DuplicateGroup: Sendable, Identifiable, Equatable {
         self.fileSize = files.first?.size ?? 0
         self.keeperIndex = Self.resolveKeeper(files: files, policy: policy)
         self.redundantCount = files.count - 1
+        self.isKeeperManual = false
+    }
+
+    /// 显式指定保留者（供 UI 手动选择使用）。
+    public init(hash: String, files: [FileEntry], keeperIndex: Int, isKeeperManual: Bool) {
+        precondition(!files.isEmpty, "DuplicateGroup 至少需要 1 个文件")
+        precondition(files.indices.contains(keeperIndex), "keeperIndex 超出范围")
+        self.hash = hash
+        self.files = files
+        self.fileSize = files.first?.size ?? 0
+        self.keeperIndex = keeperIndex
+        self.redundantCount = files.count - 1
+        self.isKeeperManual = isKeeperManual
     }
 
     public var id: String { hash }
     public var keeper: FileEntry { files[keeperIndex] }
     public var redundant: [FileEntry] { files.enumerated().filter { $0.offset != keeperIndex }.map { $0.element } }
+
+    /// 返回一份新分组，把指定 URL 所在的副本设为保留者；URL 不在组内则原样返回。
+    public func keeping(url: URL) -> DuplicateGroup {
+        guard let index = files.firstIndex(where: { $0.url == url }) else { return self }
+        return DuplicateGroup(hash: hash, files: files, keeperIndex: index, isKeeperManual: true)
+    }
+
+    /// 放弃手动选择，回到策略自动选出的保留者。
+    public func resettingKeeper(policy: KeepPolicy = .newest) -> DuplicateGroup {
+        DuplicateGroup(hash: hash, files: files, policy: policy)
+    }
+
     /// 可回收空间按每份冗余副本的**实际体积**累加，避免组内有异常条目时统计失真。
     public var reclaimableBytes: UInt64 {
         files.enumerated().reduce(0) { total, pair in

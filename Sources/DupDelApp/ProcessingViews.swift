@@ -45,7 +45,7 @@ struct DuplicateGroupsView: View {
 
             List {
                 ForEach(viewModel.displayedGroups) { group in
-                    DuplicateGroupRow(group: group)
+                    DuplicateGroupRow(group: group, viewModel: viewModel)
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
@@ -64,39 +64,45 @@ struct DuplicateGroupsView: View {
 
 struct DuplicateGroupRow: View {
     let group: DuplicateGroup
+    @ObservedObject var viewModel: AppViewModel
 
     var body: some View {
         DisclosureGroup {
             ForEach(group.files, id: \.url) { entry in
-                HStack(spacing: 8) {
-                    Image(systemName: entry.url == group.keeper.url ? "checkmark.seal.fill" : "trash")
-                        .foregroundStyle(entry.url == group.keeper.url ? .green : .secondary)
-                        .frame(width: 16)
-                    Text(entry.url.path)
-                        .font(.system(.caption, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Text(entry.url == group.keeper.url ? "保留（最新）" : Self.dateString(entry.recency))
-                        .font(.caption)
-                        .foregroundStyle(entry.url == group.keeper.url ? .green : .secondary)
+                let isKeeper = entry.url == group.keeper.url
+                DuplicateFileRow(
+                    entry: entry,
+                    isKeeper: isKeeper,
+                    isManual: group.isKeeperManual,
+                    groupSize: group.fileSize
+                ) {
+                    isKeeper ? viewModel.resetKeeper(for: group) : viewModel.selectKeeper(entry.url, for: group)
                 }
-                .padding(.leading, 18)
             }
         } label: {
             HStack(spacing: 10) {
                 Text("\(group.files.count) 份")
                     .font(.system(.body, design: .rounded, weight: .semibold))
                     .frame(width: 56, alignment: .leading)
-                Text("单份 \(ByteFormatter.string(group.fileSize))")
+                Text("单份 \(ByteFormatter.string(group.fileSize))（\(Self.exactBytes(group.fileSize)) 字节）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if group.isKeeperManual {
+                    Text("已手动指定保留")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                }
                 Spacer()
                 Text("可回收 \(ByteFormatter.string(group.reclaimableBytes))")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
         }
+    }
+
+    /// 带千分位的精确字节数，用于确认「被判定为重复的这些文件体积确实一样」。
+    static func exactBytes(_ bytes: UInt64) -> String {
+        ByteFormatter.count(Int(bytes))
     }
 
     private static let formatter: DateFormatter = {
@@ -106,8 +112,46 @@ struct DuplicateGroupRow: View {
         return formatter
     }()
 
-    private static func dateString(_ date: Date) -> String {
+    static func dateString(_ date: Date) -> String {
         formatter.string(from: date)
+    }
+}
+
+/// 组内单份副本：路径 + 精确体积 + 保留/时间。
+/// 体积与组不一致时标为橙色——正常情况下不该出现，出现说明文件在分析期间被改动，应重新分析。
+struct DuplicateFileRow: View {
+    let entry: FileEntry
+    let isKeeper: Bool
+    let isManual: Bool
+    let groupSize: UInt64
+    /// 点击图标：独占保留者时切到这一份；已是保留者时恢复自动选择。
+    let onToggle: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onToggle) {
+                Image(systemName: isKeeper ? "checkmark.seal.fill" : "seal")
+                    .foregroundStyle(isKeeper ? Color.green : Color.secondary)
+                    .frame(width: 16)
+            }
+            .buttonStyle(.plain)
+            .help(isKeeper ? "点击恢复自动选择（保留最新）" : "点击改为保留这一份")
+            Text(entry.url.path)
+                .font(.system(.caption, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Text(DuplicateGroupRow.exactBytes(entry.size))
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(entry.size == groupSize ? Color.secondary : Color.orange)
+                .help(ByteFormatter.string(entry.size))
+                .frame(minWidth: 88, alignment: .trailing)
+            Text(isKeeper ? (isManual ? "保留（手动）" : "保留（最新）") : DuplicateGroupRow.dateString(entry.recency))
+                .font(.caption)
+                .foregroundStyle(isKeeper ? Color.green : Color.secondary)
+                .frame(width: 84, alignment: .trailing)
+        }
+        .padding(.leading, 18)
     }
 }
 

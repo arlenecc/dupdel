@@ -186,6 +186,63 @@ import Testing
         #expect(result.failures.isEmpty)
     }
 
+    @Test func cleaningRespectsManuallySelectedKeeper() async throws {
+        let temp = try TempDirectory()
+        defer { temp.cleanup() }
+
+        let older = try temp.write("dup", to: "a/old.txt", modified: .test(secondsSince1970: 1_000))
+        let newer = try temp.write("dup", to: "b/newest.txt", modified: .test(secondsSince1970: 3_000))
+
+        let analysis = try await engine.analyse(root: temp.url)
+        let group = try #require(analysis.groups.first)
+        // 默认保留最新的一份
+        #expect(group.keeper.url == newer)
+        #expect(group.isKeeperManual == false)
+
+        // 用户想保留较旧的那份
+        let manual = group.keeping(url: older)
+        #expect(manual.isKeeperManual)
+        #expect(manual.keeper.url == older)
+        #expect(manual.redundant.map(\.url) == [newer])
+
+        let result = cleaner.clean(groups: [manual], root: temp.url)
+
+        #expect(result.deletedFiles == 1)
+        #expect(fileExists(older))
+        #expect(fileExists(newer) == false)
+    }
+
+    @Test func keepingRejectsForeignURLAndCanBeReset() async throws {
+        let temp = try TempDirectory()
+        defer { temp.cleanup() }
+
+        let older = try temp.write("dup", to: "a/old.txt", modified: .test(secondsSince1970: 1_000))
+        try temp.write("dup", to: "b/newest.txt", modified: .test(secondsSince1970: 3_000))
+
+        let analysis = try await engine.analyse(root: temp.url)
+        let group = try #require(analysis.groups.first)
+        let foreign = temp.url(of: "c/not-in-group.txt")
+
+        #expect(group.keeping(url: foreign).keeperIndex == group.keeperIndex)
+
+        let manual = group.keeping(url: older)
+        #expect(manual.resettingKeeper().keeper.url != older)
+        #expect(manual.resettingKeeper().isKeeperManual == false)
+
+        // 分析结果整体套用选择：空字典视为无选择（原样返回）
+        let applied = analysis.applyingKeeperSelections([group.id: older])
+        #expect(applied.groups.first?.keeper.url == older)
+        #expect(applied.applyingKeeperSelections([:]) == applied)
+        // 改选到另一份同样生效（files 按路径升序，最后一份是 b/newest.txt）
+        let reselect = analysis.applyingKeeperSelections([group.id: temp.url(of: "b/newest.txt")])
+        #expect(reselect.groups.first?.keeper.url == temp.url(of: "b/newest.txt"))
+        #expect(reselect.groups.first?.redundant.map(\.url) == [older])
+    }
+
+    private func fileExists(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+    }
+
     @Test func trashModeRemovesFiles() async throws {
         let temp = try TempDirectory()
         defer { temp.cleanup() }

@@ -98,6 +98,10 @@ final class AppViewModel: ObservableObject {
     private var lastLogDate: Date = .distantPast
     private var lastProgressDate: Date = .distantPast
     private var displayedGroupsCache: [DuplicateGroup] = []
+    /// 引擎产出的原始结果（未套用手动保留选择），清理时以其为基准重新套用选择。
+    private var rawAnalysis: AnalysisResult?
+    /// 用户手动指定的保留者：「组 id → 保留文件的 URL」。
+    private var keeperSelections: [String: URL] = [:]
 
     // MARK: - 派生状态
 
@@ -121,8 +125,32 @@ final class AppViewModel: ObservableObject {
     }
 
     private func updateAnalysis(_ result: AnalysisResult?) {
+        rawAnalysis = result
+        keeperSelections.removeAll()
         analysis = result
         displayedGroupsCache = result.map { Array($0.groups.prefix(Self.maxRenderedGroups)) } ?? []
+    }
+
+    // MARK: - 手动选择保留者
+
+    /// 把某组里指定路径的那份设为保留者（其余仍是待删除的副本）。
+    func selectKeeper(_ url: URL, for group: DuplicateGroup) {
+        keeperSelections[group.id] = url
+        refreshWithSelections()
+    }
+
+    /// 放弃手动选择，回到「保留最新」的自动结果。
+    func resetKeeper(for group: DuplicateGroup) {
+        keeperSelections.removeValue(forKey: group.id)
+        refreshWithSelections()
+    }
+
+    /// 重新按当前选择生成分析结果，保证列表与「开始清理」用的是同一份数据。
+    private func refreshWithSelections() {
+        guard let raw = rawAnalysis else { return }
+        let result = raw.applyingKeeperSelections(keeperSelections)
+        analysis = result
+        displayedGroupsCache = Array(result.groups.prefix(Self.maxRenderedGroups))
     }
 
     var progressValue: Double? {

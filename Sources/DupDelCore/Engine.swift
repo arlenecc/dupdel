@@ -30,6 +30,26 @@ public struct AnalysisResult: Sendable, Equatable {
         self.duration = duration
     }
 
+    /// 套用用户手动指定的保留者：`selections` 为「组 id → 保留文件的 URL」。
+    /// 未出现在字典里的组保持策略自动选择。
+    public func applyingKeeperSelections(_ selections: [String: URL]) -> AnalysisResult {
+        guard !selections.isEmpty else { return self }
+        let groups = self.groups.map { group -> DuplicateGroup in
+            guard let url = selections[group.id] else { return group }
+            return group.keeping(url: url)
+        }
+        return AnalysisResult(
+            root: root,
+            totalFiles: totalFiles,
+            totalBytes: totalBytes,
+            groups: groups,
+            skippedFiles: skippedFiles,
+            inaccessibleDirectories: inaccessibleDirectories,
+            unreadableFiles: unreadableFiles,
+            duration: duration
+        )
+    }
+
     public var duplicateGroupCount: Int { groups.count }
     public var redundantFileCount: Int { groups.reduce(0) { $0 + $1.redundantCount } }
     public var reclaimableBytes: UInt64 { groups.reduce(0) { $0 + $1.reclaimableBytes } }
