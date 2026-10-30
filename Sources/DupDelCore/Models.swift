@@ -48,7 +48,18 @@ public struct DuplicateGroup: Sendable, Identifiable, Equatable {
     public var id: String { hash }
     public var keeper: FileEntry { files[keeperIndex] }
     public var redundant: [FileEntry] { files.enumerated().filter { $0.offset != keeperIndex }.map { $0.element } }
-    public var reclaimableBytes: UInt64 { fileSize * UInt64(Swift.max(0, files.count - 1)) }
+    /// 可回收空间按每份冗余副本的**实际体积**累加，避免组内有异常条目时统计失真。
+    public var reclaimableBytes: UInt64 {
+        files.enumerated().reduce(0) { total, pair in
+            pair.offset == keeperIndex ? total : total + pair.element.size
+        }
+    }
+
+    /// 去掉构造时附带的体积前缀后的内容哈希，用于清理前的复核。
+    public var contentHash: String {
+        guard let separator = hash.firstIndex(of: "-") else { return hash }
+        return String(hash[hash.index(after: separator)...])
+    }
 
     /// 保留规则：日期最新（或最旧）；日期相同时按路径字典序，保证结果稳定可复现。
     public static func resolveKeeper(files: [FileEntry], policy: KeepPolicy) -> Int {

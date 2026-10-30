@@ -320,6 +320,9 @@ final class AppViewModel: ObservableObject {
                 if result.missingFiles > 0 {
                     appendLog("其中 \(ByteFormatter.count(result.missingFiles)) 个文件在分析后已被移除，自动跳过", level: .warning)
                 }
+                if result.unverifiedFiles > 0 {
+                    appendLog("其中 \(ByteFormatter.count(result.unverifiedFiles)) 个文件在分析后内容发生变化，复核未通过，已安全保留", level: .warning)
+                }
                 for failure in result.failures.prefix(5) {
                     appendLog("删除失败: \(failure.url.path) (\(failure.reason))", level: .error)
                 }

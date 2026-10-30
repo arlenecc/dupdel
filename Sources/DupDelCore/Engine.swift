@@ -50,6 +50,8 @@ private struct GroupKey: Hashable {
 private struct HashPhaseResult: Sendable {
     /// 与 entries 一一对应的哈希结果，nil 表示读取失败或被取消。
     let hashes: [String?]
+    /// 与 entries 一一对应的文件属性快照，nil 表示未读取成功。
+    let stats: [FileStat?]
     let failures: [FileIssue]
 }
 
@@ -149,25 +151,30 @@ public final class DedupEngine: Sendable {
 
             try Task.checkCancellation()
 
-            var partialGroups: [GroupKey: [FileEntry]] = [:]
+            // 每个候选文件在哈希时刻的属性快照；分组阶段用下标寻址，避免再维护一份字典
+            var candidateStats: [FileStat?] = Array(repeating: nil, count: candidates.count)
+            for (index, stat) in partial.stats.enumerated() { candidateStats[index] = stat }
+
+            var partialGroups: [GroupKey: [Int]] = [:]
             for (index, entry) in candidates.enumerated() {
                 guard let hash = partial.hashes[index] else { continue }
                 let key = GroupKey(size: entry.size, isFull: entry.size <= partialBytes, hash: hash)
-                partialGroups[key, default: []].append(entry)
+                partialGroups[key, default: []].append(index)
             }
 
-            var finalGroups: [GroupKey: [FileEntry]] = [:]
-            var needFullHash: [FileEntry] = []
-            for (key, entries) in partialGroups where entries.count > 1 {
+            var finalGroups: [GroupKey: [Int]] = [:]
+            var needFullHash: [Int] = []
+            for (key, indices) in partialGroups where indices.count > 1 {
                 if key.isFull {
-                    finalGroups[key] = entries
+                    finalGroups[key] = indices
                 } else {
-                    needFullHash.append(contentsOf: entries)
+                    needFullHash.append(contentsOf: indices)
                 }
             }
 
             // 阶段二：仅对部分哈希冲突的文件做完整哈希。
-            let fullCandidates = needFullHash
+            let fullCandidateIndices = needFullHash
+            let fullCandidates = fullCandidateIndices.map { candidates[$0] }
             if !fullCandidates.isEmpty {
                 reporter.report(
                     ProgressUpdate(phase: .fullHashing, processed: 0, total: fullCandidates.count, detail: "完整校验 \(ByteFormatter.count(fullCandidates.count)) 个文件…"),
@@ -193,20 +200,22 @@ public final class DedupEngine: Sendable {
                     }
                 }
                 Self.appendIssues(full.failures, to: &unreadable)
-                for (index, entry) in fullCandidates.enumerated() {
-                    guard let hash = full.hashes[index] else { continue }
+                for (offset, candidateIndex) in fullCandidateIndices.enumerated() {
+                    guard let hash = full.hashes[offset] else { continue }
+                    candidateStats[candidateIndex] = full.stats[offset]
+                    let entry = candidates[candidateIndex]
                     let key = GroupKey(size: entry.size, isFull: true, hash: hash)
-                    finalGroups[key, default: []].append(entry)
+                    finalGroups[key, default: []].append(candidateIndex)
                 }
             }
 
             try Task.checkCancellation()
 
             let groups = finalGroups
-                .filter { $0.value.count > 1 }
-                .map { key, entries in
-                    let sorted = entries.sorted { $0.path < $1.path }
-                    return DuplicateGroup(hash: "\(key.size)-\(key.hash)", files: sorted, policy: .newest)
+                .compactMap { key, indices -> DuplicateGroup? in
+                    let members = Self.membersOf(candidates: candidates, indices: indices, stats: candidateStats)
+                    guard members.count > 1 else { return nil }
+                    return DuplicateGroup(hash: "\(key.size)-\(key.hash)", files: members, policy: .newest)
                 }
                 .sorted { lhs, rhs in
                     if lhs.reclaimableBytes != rhs.reclaimableBytes { return lhs.reclaimableBytes > rhs.reclaimableBytes }
@@ -238,6 +247,28 @@ public final class DedupEngine: Sendable {
         }
     }
 
+    /// 把某一组的候选下标还原成文件列表（按路径升序），并剔除其中的硬链接重复项。
+    ///
+    /// 同一 inode 的多个目录项（硬链接）指向同一份数据：删除其中一份不会释放任何空间，
+    /// 因此它们不构成「可回收的重复」。组内每个 inode 只保留一个代表，
+    /// 若剔重后不足两份则调用方不会成组。
+    private static func membersOf(
+        candidates: [FileEntry],
+        indices: [Int],
+        stats: [FileStat?]
+    ) -> [FileEntry] {
+        let sorted = indices.sorted { candidates[$0].path < candidates[$1].path }
+        var seenIdentities: Set<FileIdentity> = []
+        var members: [FileEntry] = []
+        for index in sorted {
+            if let identity = stats[index]?.identity, seenIdentities.insert(identity).inserted == false {
+                continue
+            }
+            members.append(candidates[index])
+        }
+        return members
+    }
+
     /// 只保留前 maxRecordedIssues 条异常，避免极端场景下内存膨胀。
     private static let maxRecordedIssues = 64
 
@@ -260,12 +291,31 @@ public final class DedupEngine: Sendable {
             maxConcurrency: concurrency,
             isCancelled: isCancelled,
             progress: progress
-        ) { entry -> String in
+        ) { entry -> (String, FileStat) in
+            // 体积稳定性校验：扫描阶段记录的体积必须与哈希时一致。
+            // 文件在分析过程中被增删/截断时，旧体积会让「size ≤ partialBytes」的
+            // 快捷判定失效（部分哈希被当成整文件哈希），也会让组内成员真实体积不一致。
+            guard let before = FileHasher.fileStat(url: entry.url) else {
+                throw DedupError.readFailed(entry.url, "无法读取文件属性")
+            }
+            guard before.size == entry.size else {
+                throw DedupError.readFailed(
+                    entry.url,
+                    "文件在分析期间发生变化（记录 \(entry.size) 字节，当前 \(before.size) 字节）"
+                )
+            }
             let limit: Int? = full ? nil : (entry.size <= partialBytes ? nil : Int(partialBytes))
-            return try FileHasher.hash(url: entry.url, maxBytes: limit, bufferSize: bufferSize)
+            let hash = try FileHasher.hash(url: entry.url, maxBytes: limit, bufferSize: bufferSize)
+            // 读取期间若被改写，哈希结果不可信，直接丢弃这次结果。
+            guard let after = FileHasher.fileStat(url: entry.url), after.size == before.size else {
+                throw DedupError.readFailed(entry.url, "读取过程中文件被修改，结果已废弃")
+            }
+            return (hash, before)
         }
 
         let failures = outcome.failures.map { FileIssue(url: entries[$0.index].url, reason: $0.reason) }
-        return HashPhaseResult(hashes: outcome.results, failures: failures)
+        let hashes = outcome.results.map { $0?.0 }
+        let stats = outcome.results.map { $0?.1 }
+        return HashPhaseResult(hashes: hashes, stats: stats, failures: failures)
     }
 }

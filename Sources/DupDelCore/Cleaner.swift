@@ -8,6 +8,9 @@ public struct CleanOptions: Sendable, Equatable {
     public var pruneEmptyDirectories: Bool = true
     /// 演练模式：只统计不实际删除。
     public var dryRun: Bool = false
+    /// 删除前重新读取文件并复核「体积 + 内容哈希」是否与所属组一致。
+    /// 代价是冗余副本会被再读一遍；换来的是：分析之后发生变化的文件不会被删掉。
+    public var verifyBeforeDeleting: Bool = true
 
     public init() {}
 }
@@ -20,6 +23,8 @@ public struct CleanResult: Sendable, Equatable {
     public var missingFiles: Int = 0
     /// 删除失败的总数（可能大于 failures 的条数，后者只保留前若干条明细）。
     public var failedFiles: Int = 0
+    /// 删除前复核未通过而被安全跳过的文件数（内容已与分析时不同）。
+    public var unverifiedFiles: Int = 0
     public var failures: [FileIssue] = []
 
     public init() {}
@@ -43,20 +48,21 @@ public struct Cleaner: Sendable {
         let rootPrefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
 
         var result = CleanResult()
-        var targets: [FileEntry] = []
+        var targets: [(group: DuplicateGroup, entry: FileEntry)] = []
         for group in groups {
             for entry in group.redundant {
                 // 安全护栏：绝不删除根目录之外的文件。
                 guard Self.canonicalPath(entry.url).hasPrefix(rootPrefix) else { continue }
-                targets.append(entry)
+                targets.append((group, entry))
             }
         }
 
         let total = targets.count
         var affectedDirectories: Set<URL> = []
 
-        for (index, entry) in targets.enumerated() {
+        for (index, target) in targets.enumerated() {
             if isCancelled() { break }
+            let entry = target.entry
             onProgress(index, total, entry.url.path)
 
             if options.dryRun {
@@ -69,6 +75,13 @@ public struct Cleaner: Sendable {
             if !FileManager.default.fileExists(atPath: entry.url.path) {
                 // 分析之后被外部删除：跳过，不计入失败
                 result.missingFiles += 1
+                continue
+            }
+
+            // 删除前的最后一道护栏：重新读取这份副本，确认它的体积与内容哈希
+            // 仍然与所属组完全一致。分析之后内容发生变化的文件一律不删。
+            if options.verifyBeforeDeleting && !Self.matchesGroup(entry: entry, group: target.group) {
+                result.unverifiedFiles += 1
                 continue
             }
 
@@ -95,6 +108,13 @@ public struct Cleaner: Sendable {
             result.prunedDirectories = prune(affectedDirectories, rootPath: rootPath, rootPrefix: rootPrefix)
         }
         return result
+    }
+
+    /// 复核某份冗余副本是否仍然与所属组完全一致（体积 + 内容哈希）。
+    private static func matchesGroup(entry: FileEntry, group: DuplicateGroup) -> Bool {
+        guard let current = FileHasher.fileStat(url: entry.url), current.size == entry.size else { return false }
+        guard let hash = try? FileHasher.hash(url: entry.url) else { return false }
+        return hash == group.contentHash
     }
 
     /// 自底向上删除空目录；根目录本身不会被删除。
